@@ -1,0 +1,327 @@
+#import <Foundation/Foundation.h>
+#import <CoreLocation/CoreLocation.h>
+#import <CoreWLAN/CoreWLAN.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
+#import <unistd.h>
+#import <sys/utsname.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <sys/sysctl.h>
+#import <mach/mach.h>
+#import <mach/host_info.h>
+#import <mach/mach_host.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
+#include <curl/curl.h>
+
+// -----------------------------------------------------------------------------
+// 1. GPS 데이터를 위한 구조체 및 CoreLocation Delegate 구현
+// -----------------------------------------------------------------------------
+
+// C 구조체: GPS 데이터 (위도, 경도)
+size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    strncat((char *)userp, (char *)contents, size * nmemb);
+    return size * nmemb;
+}
+
+typedef struct {
+    double latitude;
+    double longitude;
+} gps_data;
+
+gps_data get_gps_data() {
+    gps_data data = {0.0, 0.0};  // 기본값 (0.0, 0.0)
+    char buffer[1024] = {0};
+    CURL *curl = curl_easy_init();
+    
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://ipinfo.io/json");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, buffer);
+        curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+        
+        // JSON 응답에서 "loc" 값을 파싱
+        char *loc_ptr = strstr(buffer, "\"loc\": \"");
+        if (loc_ptr) {
+            loc_ptr += 8;  // "loc": " 부분을 건너뜀
+            char *end_ptr = strchr(loc_ptr, '"');  // 끝나는 따옴표 찾기
+            if (end_ptr) {
+                *end_ptr = '\0';
+                // 위도, 경도를 분리하여 저장
+                sscanf(loc_ptr, "%lf,%lf", &data.latitude, &data.longitude);
+            }
+        }
+    }
+    return data;
+}
+
+// -----------------------------------------------------------------------------
+// 2. 네트워크 상태 가져오기: 활성 인터페이스의 종류 (Wi‑Fi, Ethernet, 기타)
+// -----------------------------------------------------------------------------
+
+NSString *getActiveNetworkStatus() {
+    // 1. SCDynamicStore를 사용하여 기본 IPv4 인터페이스(BSD 이름)를 얻음
+    NSString *primaryInterface = nil;
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("MyApp"), NULL, NULL);
+    if (store) {
+        CFDictionaryRef globalIPv4 = SCDynamicStoreCopyValue(store, CFSTR("State:/Network/Global/IPv4"));
+        if (globalIPv4) {
+            CFStringRef primaryIF = CFDictionaryGetValue(globalIPv4, CFSTR("PrimaryInterface"));
+            if (primaryIF) {
+                primaryInterface = [NSString stringWithString:(__bridge NSString *)primaryIF];
+            }
+            CFRelease(globalIPv4);
+        }
+        CFRelease(store);
+    }
+    
+    if (!primaryInterface) {
+        return @"Unknown";
+    }
+    
+    // 2. CoreWLAN을 사용하여 Wi‑Fi 연결 여부 확인
+    CWInterface *wifiInterface = [[CWWiFiClient sharedWiFiClient] interfaceWithName:primaryInterface];
+    if (wifiInterface) {
+        NSString *ssid = [wifiInterface ssid];
+        if (ssid && [ssid length] > 0) {
+            return [NSString stringWithFormat:@"Wi-Fi (%@)", ssid];
+        } else {
+            return @"Wi-Fi (No SSID)";
+        }
+    }
+    
+    // 3. Wi‑Fi가 아니라면, 기본 인터페이스 이름이 "en"으로 시작하면 Ethernet (LAN)으로 간주
+    if ([primaryInterface hasPrefix:@"en"]) {
+        return @"Ethernet (LAN)";
+    }
+    
+    // 4. 추가로 SCNetworkInterfaceCopyAll()을 사용하여 인터페이스 타입 확인 (필요 시)
+    CFArrayRef interfaceArray = SCNetworkInterfaceCopyAll();
+    NSString *interfaceType = @"Unknown";
+    if (interfaceArray) {
+        for (CFIndex i = 0; i < CFArrayGetCount(interfaceArray); i++) {
+            SCNetworkInterfaceRef interface = CFArrayGetValueAtIndex(interfaceArray, i);
+            CFStringRef bsdName = SCNetworkInterfaceGetBSDName(interface);
+            if (bsdName && [primaryInterface isEqualToString:(__bridge NSString *)bsdName]) {
+                CFStringRef ifType = SCNetworkInterfaceGetInterfaceType(interface);
+                if (ifType) {
+                    interfaceType = [NSString stringWithFormat:@"%@", (__bridge NSString *)ifType];
+                }
+                break;
+            }
+        }
+        CFRelease(interfaceArray);
+    }
+    
+    if ([interfaceType isEqualToString:@"Unknown"]) {
+        return [NSString stringWithFormat:@"Other (%@)", primaryInterface];
+    }
+    return interfaceType;
+}
+
+void get_network_status(char *buffer, size_t size) {
+    NSString *netStatus = getActiveNetworkStatus();
+    snprintf(buffer, size, "%s", [netStatus UTF8String]);
+}
+
+// -----------------------------------------------------------------------------
+// 3. 시스템 데이터 수집: 네트워크 사용량, OS, 하드웨어, 배터리, CPU, 메모리 등
+// -----------------------------------------------------------------------------
+
+// 3.1. 네트워크 사용량: getifaddrs()를 사용하여 지정된 인터페이스("en0")의 전송 바이트(tx_bytes)를 구함
+unsigned long get_data_usage(const char *iface) {
+    struct ifaddrs *ifap, *ifa;
+    unsigned long tx_bytes = 0;
+    
+    if (getifaddrs(&ifap) != 0) {
+        perror("getifaddrs");
+        return 0;
+    }
+    
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (ifa->ifa_data == NULL)
+            continue;
+        if (strcmp(ifa->ifa_name, iface) == 0) {
+            struct if_data *ifd = (struct if_data *)ifa->ifa_data;
+            tx_bytes = ifd->ifi_obytes;
+            break;
+        }
+    }
+    freeifaddrs(ifap);
+    return tx_bytes;
+}
+
+// 3.2. OS 버전: uname()을 이용하여 정보를 가져옴
+void get_os_version(char *buffer, size_t size) {
+    struct utsname uts;
+    if (uname(&uts) == 0) {
+        snprintf(buffer, size, "%s %s", uts.sysname, uts.release);
+    } else {
+        strncpy(buffer, "Unknown OS", size);
+    }
+}
+
+// 3.3. 하드웨어 정보: sysctlbyname()을 통해 CPU 브랜드 정보를 읽어옴
+void get_hardware_info(char *buffer, size_t size) {
+    size_t len = size;
+    if (sysctlbyname("machdep.cpu.brand_string", buffer, &len, NULL, 0) != 0) {
+        strncpy(buffer, "Unknown Hardware", size);
+    }
+}
+
+// 3.4. 배터리 상태: IOKit을 사용하여 배터리 잔량(%)을 반환
+int get_battery_level() {
+    CFTypeRef powerInfo = IOPSCopyPowerSourcesInfo();
+    if (!powerInfo) {
+        return -1;
+    }
+    
+    CFArrayRef powerSources = IOPSCopyPowerSourcesList(powerInfo);
+    if (!powerSources) {
+        CFRelease(powerInfo);
+        return -1;
+    }
+    
+    int batteryLevel = -1;
+    CFIndex count = CFArrayGetCount(powerSources);
+    if (count == 0) {
+        CFRelease(powerSources);
+        CFRelease(powerInfo);
+        return -1;
+    }
+    
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef powerSource = IOPSGetPowerSourceDescription(powerInfo, CFArrayGetValueAtIndex(powerSources, i));
+        if (powerSource) {
+            CFNumberRef curCapacity = CFDictionaryGetValue(powerSource, CFSTR(kIOPSCurrentCapacityKey));
+            CFNumberRef maxCapacity = CFDictionaryGetValue(powerSource, CFSTR(kIOPSMaxCapacityKey));
+            if (curCapacity && maxCapacity) {
+                int current, max;
+                CFNumberGetValue(curCapacity, kCFNumberIntType, &current);
+                CFNumberGetValue(maxCapacity, kCFNumberIntType, &max);
+                if (max > 0) {
+                    batteryLevel = (int)(((double)current / (double)max) * 100);
+                    break;
+                }
+            }
+        }
+    }
+    
+    CFRelease(powerSources);
+    CFRelease(powerInfo);
+    return batteryLevel;
+}
+
+// 3.5. CPU 사용률: mach API를 사용하여 전체 CPU 사용률(%)을 계산
+float get_cpu_usage() {
+    host_cpu_load_info_data_t cpuinfo;
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    kern_return_t kr = host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&cpuinfo, &count);
+    if (kr != KERN_SUCCESS) {
+        return -1.0f;
+    }
+    uint64_t totalTicks = 0;
+    for (int i = 0; i < CPU_STATE_MAX; i++) {
+        totalTicks += cpuinfo.cpu_ticks[i];
+    }
+    uint64_t idleTicks = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
+    if (totalTicks == 0)
+        return 0.0f;
+    float usage = (float)(totalTicks - idleTicks) / totalTicks * 100.0f;
+    return usage;
+}
+
+// 3.6. 메모리 사용률: 전체 메모리 대비 사용 중인 메모리(%)를 계산
+float get_memory_usage() {
+    mach_msg_type_number_t count = HOST_VM_INFO_COUNT;
+    vm_statistics_data_t vm_stat;
+    if (host_statistics(mach_host_self(), HOST_VM_INFO, (host_info_t)&vm_stat, &count) != KERN_SUCCESS) {
+        return -1.0f;
+    }
+    int64_t memsize = 0;
+    size_t size = sizeof(memsize);
+    sysctlbyname("hw.memsize", &memsize, &size, NULL, 0);
+    vm_size_t page_size;
+    host_page_size(mach_host_self(), &page_size);
+    int64_t free_memory = vm_stat.free_count * page_size;
+    float used_percentage = (float)(memsize - free_memory) / memsize * 100.0f;
+    return used_percentage;
+}
+
+// -----------------------------------------------------------------------------
+// 4. user_data 구조체 및 get_user_data 함수
+// -----------------------------------------------------------------------------
+
+typedef struct {
+    char network_status[64];    // 예: "Wi‑Fi (SSID)" 또는 "Ethernet (LAN)" 등
+    double gps_latitude;        // GPS 위도
+    double gps_longitude;       // GPS 경도
+    char device_type[16];       // 예: "computer"
+    unsigned long data_usage;   // 전송된 데이터 바이트 수
+    char os_version[64];        // OS 버전 정보
+    char hardware_info[128];    // 하드웨어 정보 (예: CPU 모델명)
+    int battery_level;          // 배터리 잔량 (%)
+    float cpu_usage;            // CPU 사용률 (%)
+    float memory_usage;         // 메모리 사용률 (%)
+} user_data;
+
+user_data get_user_data() {
+    user_data data;
+    
+    // 네트워크 상태: 통합된 get_network_status()를 통해 가져옴
+    get_network_status(data.network_status, sizeof(data.network_status));
+    
+    // GPS 좌표: CoreLocation을 통해 실제 값을 가져옴
+    gps_data gps = get_gps_data();
+    data.gps_latitude = gps.latitude;
+    data.gps_longitude = gps.longitude;
+    
+    // 디바이스 종류: macOS 컴퓨터로 간주
+    strcpy(data.device_type, "computer");
+    
+    // 데이터 사용량: 네트워크 인터페이스 "en0" 기준 (Wi‑Fi)
+    data.data_usage = get_data_usage("en0");
+    
+    // 운영체제 정보
+    get_os_version(data.os_version, sizeof(data.os_version));
+    
+    // 하드웨어 정보 (CPU)
+    get_hardware_info(data.hardware_info, sizeof(data.hardware_info));
+    
+    // 배터리 상태
+    data.battery_level = get_battery_level();
+    
+    // CPU 사용률
+    data.cpu_usage = get_cpu_usage();
+    
+    // 메모리 사용률
+    data.memory_usage = get_memory_usage();
+    
+    return data;
+}
+
+// -----------------------------------------------------------------------------
+// 5. main 함수: 수집된 정보를 출력
+// -----------------------------------------------------------------------------
+int main(void) {
+    user_data data = get_user_data();
+    
+    printf("Network Status: %s\n", data.network_status);
+    printf("GPS Coordinates: (%.6f, %.6f)\n", data.gps_latitude, data.gps_longitude);
+    printf("Device Type: %s\n", data.device_type);
+    printf("Data Usage (TX): %lu bytes\n", data.data_usage);
+    printf("OS Version: %s\n", data.os_version);
+    printf("Hardware Info: %s\n", data.hardware_info);
+    if (data.battery_level != -1)
+        printf("Battery Level: %d%%\n", data.battery_level);
+    else
+        printf("Battery Level: Not available\n");
+    printf("CPU Usage: %.2f%%\n", data.cpu_usage);
+    printf("Memory Usage: %.2f%%\n", data.memory_usage);
+    
+    return 0;
+}
